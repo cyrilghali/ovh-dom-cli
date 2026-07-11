@@ -136,12 +136,20 @@ function isOvhParking(r) {
 
 function ovhRecordToCf(r, domain, proxy) {
   const name = r.subDomain ? `${r.subDomain}.${domain}` : domain;
-  const base = { type: r.fieldType, name, ttl: r.ttl && r.ttl >= 60 ? r.ttl : 1 };
-  if (r.fieldType === "MX") {
+  // Cloudflare a retiré le type SPF (déprécié) : on le porte en TXT, sinon
+  // POST /dns_records échoue (souvent avec un message d'erreur vide).
+  const type = r.fieldType === "SPF" ? "TXT" : r.fieldType;
+  const base = { type, name, ttl: r.ttl && r.ttl >= 60 ? r.ttl : 1 };
+  if (type === "MX") {
     const m = String(r.target).trim().match(/^(\d+)\s+(.*)$/);
     return { ...base, priority: m ? Number(m[1]) : 0, content: (m ? m[2] : r.target).replace(/\.$/, "") };
   }
-  const proxied = proxy && ["A", "AAAA", "CNAME"].includes(r.fieldType);
+  if (type === "TXT") {
+    // Contenu libre : ne pas rogner le point final. OVH encadre parfois la
+    // valeur de guillemets ; Cloudflare les réajoute lui-même.
+    return { ...base, content: String(r.target).trim().replace(/^"([\s\S]*)"$/, "$1") };
+  }
+  const proxied = proxy && ["A", "AAAA", "CNAME"].includes(type);
   return { ...base, content: String(r.target).replace(/\.$/, ""), proxied };
 }
 

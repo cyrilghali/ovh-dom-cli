@@ -23,7 +23,13 @@ async function cf(method, path, body = null) {
 }
 
 export async function verify() {
-  return cf("GET", "/user/tokens/verify");
+  // Les « Account API Tokens » (cfat_) ne se vérifient pas sur /user/tokens :
+  // on ne bloque pas la migration pour un simple contrôle cosmétique.
+  try {
+    return await cf("GET", "/user/tokens/verify");
+  } catch {
+    return { status: "account-token" };
+  }
 }
 export async function accountId() {
   // Un token « Zone » ne peut souvent pas lister /accounts → on récupère l'ID de
