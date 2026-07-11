@@ -12,6 +12,7 @@
 //     --yes            confirme l'achat (sans, on s'arrête au récap = dry-run)
 //   ovhdom selftest             vérifie la signature (hors-ligne)
 
+import * as cf from "./cf.mjs";
 import { loadConfig, ovh, sign } from "./ovh.mjs";
 
 const [, , cmd, ...rest] = process.argv;
@@ -43,6 +44,10 @@ const HELP = `ovhdom — domaines OVHcloud en ligne de commande
       --duration P1Y durée (défaut P1Y)
       --auto-pay     paie via le moyen de paiement par défaut
       --yes          confirme (sinon : récap seul, rien n'est acheté)
+  ovhdom cf-migrate <domaine> [--apply] [--proxy]
+                                  migre le DNS OVH → Cloudflare (crée la zone,
+                                  importe les records, bascule les NS). Dry-run
+                                  par défaut ; besoin de CF_API_TOKEN.
   ovhdom selftest                 auto-test de la signature (hors-ligne)
 
 Identifiants : crée un token sur https://eu.api.ovh.com/createToken/
@@ -110,6 +115,107 @@ async function order(domain) {
   if (!flag("auto-pay")) console.log("Ajoute --auto-pay pour régler automatiquement, sinon paie via le lien ci-dessus.");
 }
 
+// ── Migration DNS OVH → Cloudflare ────────────────────────────────────────────
+// Lit la zone DNS OVH, (re)crée la zone Cloudflare + importe les enregistrements,
+// puis bascule les serveurs de noms OVH vers Cloudflare. Dry-run par défaut ;
+// --apply exécute. --proxy active le proxy CF (orange) sur A/AAAA/CNAME (défaut :
+// DNS-only, recommandé pour un site Vercel).
+
+const SKIP_TYPES = new Set(["NS", "SOA"]);
+const OVH_PARK_IPS = new Set(["213.186.33.5"]);
+
+// Enregistrements de parking OVH par défaut, sans valeur (à ne pas transporter
+// sur Cloudflare). Contournable avec --all.
+function isOvhParking(r) {
+  const t = String(r.target).trim();
+  if ((r.fieldType === "A" || r.fieldType === "AAAA") && OVH_PARK_IPS.has(t)) return true;
+  if (r.fieldType === "TXT" && /^"?\d+\|/.test(t)) return true; // "1|www…", "3|welcome"
+  if (r.fieldType === "CNAME" && r.subDomain === "ftp") return true;
+  return false;
+}
+
+function ovhRecordToCf(r, domain, proxy) {
+  const name = r.subDomain ? `${r.subDomain}.${domain}` : domain;
+  const base = { type: r.fieldType, name, ttl: r.ttl && r.ttl >= 60 ? r.ttl : 1 };
+  if (r.fieldType === "MX") {
+    const m = String(r.target).trim().match(/^(\d+)\s+(.*)$/);
+    return { ...base, priority: m ? Number(m[1]) : 0, content: (m ? m[2] : r.target).replace(/\.$/, "") };
+  }
+  const proxied = proxy && ["A", "AAAA", "CNAME"].includes(r.fieldType);
+  return { ...base, content: String(r.target).replace(/\.$/, ""), proxied };
+}
+
+async function cfMigrate(domain) {
+  if (!domain) throw new Error("Usage : ovhdom cf-migrate <domaine> [--apply] [--proxy]");
+  const apply = flag("apply");
+  const proxy = flag("proxy");
+
+  const v = await cf.verify();
+  console.log(`Cloudflare : token ${v.status === "active" ? "actif ✓" : v.status}`);
+
+  // 1. Enregistrements DNS actuels chez OVH
+  let ids = [];
+  try {
+    ids = await ovh("GET", `/domain/zone/${domain}/record`);
+  } catch (e) {
+    console.log(`Zone DNS OVH introuvable (${e.message.slice(0, 50)}) — le domaine n'a peut-être pas encore de zone.`);
+  }
+  const all = flag("all");
+  const records = [];
+  let parkingSkipped = 0;
+  for (const id of ids) {
+    const r = await ovh("GET", `/domain/zone/${domain}/record/${id}`);
+    if (SKIP_TYPES.has(r.fieldType)) continue;
+    if (!all && isOvhParking(r)) {
+      parkingSkipped += 1;
+      continue;
+    }
+    records.push(r);
+  }
+  console.log(`OVH : ${records.length} enregistrement(s) à importer${parkingSkipped ? ` (${parkingSkipped} parking OVH ignoré(s) ; --all pour tout garder)` : ""}.`);
+  for (const r of records) {
+    console.log(`  ${r.fieldType} ${r.subDomain || "@"} → ${r.target}`);
+  }
+
+  // 2. Zone Cloudflare
+  let zone = await cf.zoneByName(domain);
+  if (zone) {
+    console.log(`Cloudflare : zone existante (${zone.status}). NS : ${(zone.name_servers || []).join(", ")}`);
+  } else if (!apply) {
+    console.log("Cloudflare : zone absente — --apply la créera et renverra les 2 serveurs de noms.");
+  } else {
+    const acc = await cf.accountId();
+    zone = await cf.createZone(domain, acc);
+    console.log(`Cloudflare : zone créée. NS : ${zone.name_servers.join(", ")}`);
+  }
+
+  if (!apply) {
+    console.log(`\nDry-run. Ajoute --apply pour : créer la zone, importer ${records.length} record(s), puis basculer les NS OVH vers Cloudflare.`);
+    return;
+  }
+
+  // 3. Import des enregistrements dans Cloudflare
+  let imported = 0;
+  const existing = new Set((await cf.listRecords(zone.id)).map((r) => `${r.type}|${r.name}|${r.content}`));
+  for (const r of records) {
+    const rec = ovhRecordToCf(r, domain, proxy);
+    if (existing.has(`${rec.type}|${rec.name}|${rec.content}`)) continue;
+    try {
+      await cf.createRecord(zone.id, rec);
+      imported += 1;
+    } catch (e) {
+      console.log(`  ⚠ ${rec.type} ${rec.name} non importé : ${e.message.slice(0, 70)}`);
+    }
+  }
+  console.log(`Cloudflare : ${imported} enregistrement(s) importé(s).`);
+
+  // 4. Bascule des serveurs de noms OVH → Cloudflare
+  const ns = (zone.name_servers || []).map((host) => ({ host }));
+  await ovh("POST", `/domain/${domain}/nameServers/update`, { nameServers: ns });
+  console.log(`OVH : serveurs de noms basculés vers Cloudflare (${zone.name_servers.join(", ")}).`);
+  console.log("Propagation : quelques minutes à quelques heures. Cloudflare activera la zone dès qu'il détecte ses NS.");
+}
+
 async function main() {
   switch (cmd) {
     case undefined:
@@ -151,6 +257,9 @@ async function main() {
       return;
     case "order":
       await order(positional());
+      return;
+    case "cf-migrate":
+      await cfMigrate(positional());
       return;
     default:
       console.error(`Commande inconnue : ${cmd}\n`);
