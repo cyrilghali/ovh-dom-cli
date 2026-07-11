@@ -1,0 +1,6 @@
+node_modules/
+# identifiants OVH — jamais committer
+.ovhdom.json
+.env
+.env.*
+.DS_Store
