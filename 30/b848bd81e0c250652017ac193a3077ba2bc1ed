@@ -1,0 +1,21 @@
+LICENSE
+  s_4ce5033809df15::t_42a2f044ea8f3f 1-21
+package.json
+  s_4ce5033809df15::t_f37903dc2d990a 4,9-13,17-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "30b848bd81e0c250652017ac193a3077ba2bc1ed",
+  "prompts": {},
+  "sessions": {
+    "s_4ce5033809df15": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0813c9aa-4e7c-4142-bc15-67544f1e5458",
+        "model": "unknown"
+      },
+      "human_author": "Cyril GHALI <cyril.ghali@tryriot.com>"
+    }
+  }
+}
